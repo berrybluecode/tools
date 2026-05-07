@@ -285,23 +285,24 @@ the original and the stripped output.
 
 ---
 
-## Integration with `preprocess_dtsx.py`
+## Chaining with downstream extractors
 
-`strip_dtsx_layout.py` produces **valid `.dtsx`** as output, so you can chain it directly
-into the existing extractor:
+`strip_dtsx_layout.py` emits **valid `.dtsx`** as output, so it can sit at the front of any
+pipeline that consumes DTSX (LLM converters, custom extractors, schema diffs, etc.) as a
+fidelity-preserving size reduction step:
+
+```text
+raw .dtsx  ->  strip_dtsx_layout.py  ->  leaner .dtsx  ->  your extractor / converter
+```
+
+Run with the opt-in flags when you want maximum reduction without losing translation-relevant
+information:
 
 ```bash
-# Step 1: strip layout / binary / boilerplate
 python3 strip_dtsx_layout.py raw_dtsx \
     --output-dir stripped_dtsx \
     --strip-empty-placeholders --strip-external-metadata
-
-# Step 2: extract LLM-friendly summary from the leaner .dtsx
-python3 preprocess_dtsx.py stripped_dtsx \
-    --output-dir extracted --format both --compact
 ```
-
-You get a smaller, fidelity-preserving DTSX before the lossy summary stage.
 
 ---
 
