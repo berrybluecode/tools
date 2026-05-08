@@ -23,16 +23,23 @@ Default removals (always on, all logic-safe):
     * <ProjectItem Name="Resources.resx" / "Settings.settings"> generated VS scaffolding
     * <ProjectItem Name="app.config">                         generated config
 
-  Pure-metadata attributes (no runtime effect):
-    * DTS:TaskContact                      Microsoft attribution boilerplate
-    * DTS:IncludeInDebugDump               per-variable debug-dump flag
+  Pure-noise attributes (no runtime effect, no translation value):
+    * DTS:IncludeInDebugDump               per-variable debug-dump bitmask
 
   Package-level provenance (only on the root <DTS:Executable>):
-    * DTS:CreationDate, DTS:CreatorName, DTS:CreatorComputerName
-    * DTS:VersionBuild, DTS:VersionGUID, DTS:VersionComments
-    * DTS:VersionMajor, DTS:VersionMinor
-    * DTS:LastModifiedProductVersion
-    * <DTS:Property DTS:Name="PackageFormatVersion">
+    * DTS:CreatorName, DTS:CreatorComputerName       (PII-flavoured: usernames / hostnames)
+    * DTS:VersionBuild, DTS:VersionGUID              (internal counters / stamps)
+    * DTS:VersionMajor, DTS:VersionMinor             (internal counters)
+    * DTS:ProductName                                (Microsoft product stamp)
+    * <DTS:Property DTS:Name="PackageFormatVersion"> (SSIS XML schema version)
+
+Kept by default because they may carry useful translation context:
+    * DTS:TaskContact          (last field hints at original SSIS version per task)
+    * DTS:CreationDate         (package age - useful for legacy detection)
+    * DTS:VersionComments      (developer release notes, often empty but possible)
+    * DTS:LastModifiedProductVersion (target SSIS version stamp)
+
+  Strip these too with --strip-signal-metadata if you don't need the signal.
 
 Optional removals (off by default):
 
@@ -49,6 +56,12 @@ Optional removals (off by default):
       via name/dataType/length, so no information needed for translation is lost.
       Note: this does change the data flow XML shape - SSIS designer would mark
       the package as needing re-validation, but the runtime logic is intact.
+
+  --strip-signal-metadata     (only if you don't need the legacy / version hints)
+    * DTS:TaskContact, DTS:CreationDate, DTS:VersionComments,
+      DTS:LastModifiedProductVersion
+      These can carry useful translation context (see "Kept by default" above);
+      strip them only if you've confirmed your converter doesn't need them.
 
 Use --keep-* flags to opt out of any default removal.
 
@@ -116,22 +129,39 @@ BUILD_PROJECT_ITEM_PATTERNS = (
     "Settings.settings",
 )
 
-METADATA_ATTRS = {  # stripped from any element where they appear
-    DTS_TAG("TaskContact"),
-    DTS_TAG("IncludeInDebugDump"),
-}
+# Attributes stripped everywhere they appear.
+# DTS:IncludeInDebugDump is a pure debug-only bitmask with no runtime effect.
+DEBUG_ATTRS = {DTS_TAG("IncludeInDebugDump")}
 
-ROOT_PROVENANCE_ATTRS = {  # stripped only from the root <DTS:Executable>
-    DTS_TAG("CreationDate"),
+# DTS:TaskContact is mostly Microsoft attribution boilerplate, BUT the third
+# field of its semicolon-separated value reveals the SSIS product version each
+# task type was originally authored against (e.g. "Microsoft SQL Server v9" =
+# SSIS 2005). That can be useful legacy-detection context for an LLM converter,
+# so we keep it by default and let users opt in to stripping it.
+SIGNAL_BEARING_ATTRS = {DTS_TAG("TaskContact")}
+
+# Stripped only from the root <DTS:Executable>. These are pure provenance /
+# internal stamps with no translation value (and DTS:CreatorName /
+# DTS:CreatorComputerName are PII-flavoured).
+ROOT_PROVENANCE_ATTRS = {
     DTS_TAG("CreatorName"),
     DTS_TAG("CreatorComputerName"),
     DTS_TAG("VersionBuild"),
     DTS_TAG("VersionGUID"),
-    DTS_TAG("VersionComments"),
     DTS_TAG("VersionMajor"),
     DTS_TAG("VersionMinor"),
-    DTS_TAG("LastModifiedProductVersion"),
     DTS_TAG("ProductName"),
+}
+
+# Kept by default - they carry real signal:
+#   DTS:CreationDate                  - reveals package age (legacy detection)
+#   DTS:VersionComments               - may contain user-authored release notes
+#   DTS:LastModifiedProductVersion    - target SSIS version (translation hint)
+# Add the corresponding tag here only if --strip-signal-metadata is set.
+SIGNAL_BEARING_ROOT_ATTRS = {
+    DTS_TAG("CreationDate"),
+    DTS_TAG("VersionComments"),
+    DTS_TAG("LastModifiedProductVersion"),
 }
 
 ROOT_PROVENANCE_PROPERTY_NAMES = {"PackageFormatVersion"}
@@ -257,17 +287,23 @@ def strip_dtsx(root: ET.Element, opts: argparse.Namespace) -> dict:
                         pass
 
     if opts.strip_metadata:
+        attrs_to_strip = set(ROOT_PROVENANCE_ATTRS)
+        if opts.strip_signal_metadata:
+            attrs_to_strip |= SIGNAL_BEARING_ROOT_ATTRS
         for attr in list(root.attrib):
-            if attr in ROOT_PROVENANCE_ATTRS:
+            if attr in attrs_to_strip:
                 del root.attrib[attr]
                 counts[f"@{attr.split('}')[-1]}"] = counts.get(
                     f"@{attr.split('}')[-1]}", 0
                 ) + 1
 
     if opts.strip_metadata_attrs:
+        attrs_to_strip = set(DEBUG_ATTRS)
+        if opts.strip_signal_metadata:
+            attrs_to_strip |= SIGNAL_BEARING_ATTRS
         for elem in root.iter():
             for attr in list(elem.attrib):
-                if attr in METADATA_ATTRS:
+                if attr in attrs_to_strip:
                     del elem.attrib[attr]
                     key = f"@{attr.split('}')[-1]}"
                     counts[key] = counts.get(key, 0) + 1
@@ -337,14 +373,14 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Keep <ProjectItem> MSBuild/codeprojectml scaffolding files.",
     )
     g.add_argument(
-        "--keep-task-contact-and-debug-dump", dest="strip_metadata_attrs",
+        "--keep-debug-dump", dest="strip_metadata_attrs",
         action="store_false",
-        help="Keep DTS:TaskContact and DTS:IncludeInDebugDump attributes.",
+        help="Keep DTS:IncludeInDebugDump attributes.",
     )
     g.add_argument(
         "--keep-metadata", dest="strip_metadata", action="store_false",
-        help="Keep package-level provenance attrs (CreationDate, CreatorName, "
-             "VersionGUID, LastModifiedProductVersion, ...) and PackageFormatVersion.",
+        help="Keep package-level provenance attrs (CreatorName, VersionGUID, "
+             "VersionBuild, ProductName, ...) and PackageFormatVersion.",
     )
 
     g2 = p.add_argument_group("opt-in flags (off by default)")
@@ -362,6 +398,15 @@ def _build_argparser() -> argparse.ArgumentParser:
              "information needed for translation is lost. Big win on wide-table "
              "data flow packages.",
     )
+    g2.add_argument(
+        "--strip-signal-metadata", action="store_true",
+        help="Also remove attributes that *may* carry useful signal but are "
+             "often noise: DTS:TaskContact (legacy SSIS-version hint per task), "
+             "DTS:CreationDate (package age), DTS:VersionComments (release notes "
+             "field, often empty), DTS:LastModifiedProductVersion (target SSIS "
+             "version). Use only if you are sure your packages don't rely on "
+             "these as translation context.",
+    )
 
     p.set_defaults(
         strip_build_files=True,
@@ -369,6 +414,7 @@ def _build_argparser() -> argparse.ArgumentParser:
         strip_metadata=True,
         strip_empty_placeholders=False,
         strip_external_metadata=False,
+        strip_signal_metadata=False,
     )
     return p
 

@@ -17,13 +17,15 @@ Real-world `.dtsx` packages are typically 30–80% bloat:
 - Designer layout XML (CDATA blob describing icon coordinates and connector positions).
 - Compiled Script Task DLLs base64-encoded inside `<BinaryItem>`.
 - MSBuild scaffolding (`*.vbproj`, `*.csproj`, `Project`, `AssemblyInfo.cs`, `Resources.Designer.cs`, …) that ships alongside the actual `ScriptMain.cs` source.
-- Microsoft attribution attributes (`DTS:TaskContact="Execute SQL Task; Microsoft Corporation; SQL Server 2019; © …"`).
-- Per-variable debug-dump flags (`DTS:IncludeInDebugDump`).
-- Package-level provenance (`CreationDate`, `CreatorName`, `VersionGUID`, …).
+- Per-variable debug-dump bitmasks (`DTS:IncludeInDebugDump`).
+- Package-level provenance (`CreatorName`, `CreatorComputerName`, `VersionGUID`, `VersionBuild`, …).
 - For wide-table data flows, `<externalMetadataColumn>` validation snapshots that duplicate the column metadata already carried on `<inputColumn>` / `<outputColumn>`.
 
-None of that is needed by an LLM converter. Removing it makes the input fit a smaller
-context window and lets the model focus on the actual ETL logic.
+None of that carries information an LLM converter needs. Removing it makes the input fit a
+smaller context window and lets the model focus on the actual ETL logic.
+
+A few attributes that **look** like boilerplate but actually carry translation-relevant
+signal are deliberately **kept** by default — see the next section.
 
 ---
 
@@ -73,8 +75,8 @@ python3 strip_dtsx_layout.py <input> --output-dir <dir> [options]
 | Flag | Disables removal of |
 | --- | --- |
 | `--keep-build-files` | MSBuild / VS scaffolding `<ProjectItem>` files |
-| `--keep-task-contact-and-debug-dump` | `DTS:TaskContact` and `DTS:IncludeInDebugDump` attributes |
-| `--keep-metadata` | Package-level provenance attrs (CreationDate, CreatorName, VersionGUID, LastModifiedProductVersion, …) and `<DTS:Property DTS:Name="PackageFormatVersion">` |
+| `--keep-debug-dump` | `DTS:IncludeInDebugDump` attribute |
+| `--keep-metadata` | Package-level provenance attrs (`CreatorName`, `CreatorComputerName`, `VersionBuild`, `VersionGUID`, `VersionMajor`, `VersionMinor`, `ProductName`) and `<DTS:Property DTS:Name="PackageFormatVersion">` |
 
 **Opt-in flags (off by default — they change the data flow XML shape, but no logic)**
 
@@ -82,6 +84,7 @@ python3 strip_dtsx_layout.py <input> --output-dir <dir> [options]
 | --- | --- | --- |
 | `--strip-empty-placeholders` | Empty `<DTS:Variables />` and default-only `<DTS:LoggingOptions DTS:FilterKind="0" />` placeholders nested *inside* per-task executables | Packages with many small Script / Execute SQL tasks |
 | `--strip-external-metadata` | `<externalMetadataColumn>` design-time validation snapshots; the column info is preserved on `<inputColumn>` / `<outputColumn>` | Wide-table data flow packages (column metadata can dominate the file) |
+| `--strip-signal-metadata` | `DTS:TaskContact`, `DTS:CreationDate`, `DTS:VersionComments`, `DTS:LastModifiedProductVersion` — kept by default because they may contain translation hints (see below) | Use only if you've confirmed your converter doesn't need legacy / version context |
 
 ---
 
@@ -111,23 +114,39 @@ python3 strip_dtsx_layout.py <input> --output-dir <dir> [options]
     | `Resources.resx`, `Settings.settings` | VS scaffolding |
     | `app.config` | .NET assembly-binding config |
 
-3. **Pure-metadata attributes** (no runtime effect)
+3. **Debug-only attribute** (no runtime effect)
 
-    - `DTS:TaskContact` — Microsoft attribution text.
-    - `DTS:IncludeInDebugDump` — debug-dump flag on variables.
+    - `DTS:IncludeInDebugDump` — per-variable bitmask controlling debug-dump inclusion.
 
-4. **Package-level provenance** (only on the root `<DTS:Executable>`)
+4. **Package-level provenance** (only on the root `<DTS:Executable>`; pure noise / PII-flavoured)
 
-    - `DTS:CreationDate`, `DTS:CreatorName`, `DTS:CreatorComputerName`
-    - `DTS:VersionBuild`, `DTS:VersionGUID`, `DTS:VersionComments`, `DTS:VersionMajor`, `DTS:VersionMinor`
-    - `DTS:LastModifiedProductVersion`, `DTS:ProductName`
-    - `<DTS:Property DTS:Name="PackageFormatVersion">`
+    - `DTS:CreatorName`, `DTS:CreatorComputerName` (usernames / hostnames)
+    - `DTS:VersionBuild`, `DTS:VersionGUID`, `DTS:VersionMajor`, `DTS:VersionMinor` (internal counters)
+    - `DTS:ProductName` (Microsoft product stamp)
+    - `<DTS:Property DTS:Name="PackageFormatVersion">` (SSIS XML schema version)
+
+### Kept by default — may carry translation signal
+
+Four attributes are deliberately **not** stripped by default. They look like boilerplate
+but routinely carry useful context for an LLM converter:
+
+| Attribute | Signal it can carry |
+| --- | --- |
+| `DTS:TaskContact` | The third semicolon-separated field is the SSIS product version each task type was originally authored against. Mixed values like `"Microsoft SQL Server v9"` (SSIS 2005) alongside `"SQL Server 2019"` reveal legacy task constructs (e.g. SSIS-2005-era `"Executes DTS packages"` task) whose semantics differ from modern equivalents. |
+| `DTS:CreationDate` | Original creation date of the package. A 2007-created package last saved with SSIS 2019 has likely been migrated through multiple versions and may use deprecated patterns. |
+| `DTS:VersionComments` | SSIS schema field for human-authored release notes. Often empty, but when populated it's real developer intent that could affect translation. |
+| `DTS:LastModifiedProductVersion` | The exact SSIS version stamp (e.g. `"15.0.2000.229"`) the package was last saved with — useful for the converter to know which feature set to target. |
+
+Use **`--strip-signal-metadata`** to remove these too if your downstream converter doesn't
+need them.
 
 ### Opt-in removals
 
 - **`--strip-empty-placeholders`** — Empty `<DTS:Variables/>` and default `<DTS:LoggingOptions DTS:FilterKind="0"/>` nested inside *per-task* executables (the package-level blocks are always kept). These are designer-emitted shells with no runtime effect.
 
 - **`--strip-external-metadata`** — `<externalMetadataColumn>` elements (and their wrapper `<externalMetadataColumns>` once empty). For each removed element, the column `name` / `dataType` / `length` is already carried on the corresponding `<inputColumn>` (via `cachedName` / `cachedDataType` / `cachedLength`) and `<outputColumn>` (via `name` / `dataType` / `length`). The runtime data flow graph (`outputColumn → path → inputColumn`) is fully intact. SSIS Designer would mark the package as "needs re-validation" because validation is what `externalMetadataColumn` exists for, but the runtime logic and translation-relevant info are unchanged.
+
+- **`--strip-signal-metadata`** — Removes the four signal-bearing attributes listed above.
 
 ---
 
@@ -147,6 +166,7 @@ python3 strip_dtsx_layout.py <input> --output-dir <dir> [options]
 | References | `DTS:DTSID`, `DTS:refId`, `lineageId`, `externalMetadataColumnId`, `connectionManagerID`, `SQLTask:Connection` |
 | Runtime attrs | `DTS:LocaleID`, `DTS:DelayValidation`, `DTS:ProtectionLevel`, `DTS:EnableConfig`, `DTS:Disabled` |
 | Annotations & comments | `<DTS:Annotation>`, all XML `<!-- … -->` comments |
+| Translation hints (default) | `DTS:TaskContact`, `DTS:CreationDate`, `DTS:VersionComments`, `DTS:LastModifiedProductVersion` |
 
 ---
 
@@ -312,6 +332,11 @@ python3 strip_dtsx_layout.py raw_dtsx \
   not bit-for-bit identical to the input. Whitespace, attribute order, namespace prefix
   declarations, and CDATA-vs-escaped-text encoding may differ. SSIS designer may mark a
   reopened package as "modified". This is expected.
+- `--strip-build-files` removes `*.vbproj` / `*.csproj` `<ProjectItem>`s, which include the
+  `<Reference Include="…">` list of assembly dependencies. In ~all real packages those are
+  standard SSIS / .NET assemblies that the source's `Imports` / `using` statements already
+  reveal. If you have Script Tasks that reference **custom DLLs** that the source code
+  accesses by reflection (extremely rare), use `--keep-build-files`.
 - `--strip-external-metadata` leaves dangling `externalMetadataColumnId` references on
   `<inputColumn>` / `<outputColumn>`. LLM converters don't follow them, but the package
   will fail SSIS Designer validation until you regenerate metadata. Do **not** use this
